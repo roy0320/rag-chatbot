@@ -4,14 +4,16 @@ from typing import TypedDict
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.language_models import BaseChatModel
 from langgraph.graph import StateGraph, START, END
 
 from rag.vector_store import VectorStore
 
 # ── 常數 ──────────────────────────────────────────────────────────────────────
 DEFAULT_MODEL = "llama3.2"
-MAX_HISTORY_TURNS = 10   # 保留最近幾輪對話送給 LLM
-MAX_RETRIES = 1          # Query Rewrite 最多重試幾次
+DEFAULT_PROVIDER = "ollama"   # 預設使用本地 Ollama
+MAX_HISTORY_TURNS = 10        # 保留最近幾輪對話送給 LLM
+MAX_RETRIES = 1               # Query Rewrite 最多重試幾次
 
 
 # ── LangGraph 狀態定義 ────────────────────────────────────────────────────────
@@ -38,10 +40,50 @@ def list_local_models() -> list[str]:
         return []
 
 
+def build_llm(provider: str, model: str, api_key: str = "") -> BaseChatModel:
+    """
+    根據選擇的 provider 建立對應的 LLM 物件。
+
+    這裡展示 LangChain 最大的優勢：
+    不管用哪個模型供應商，對外介面都一樣（BaseChatModel），
+    LangGraph 的節點完全不需要修改。
+
+    支援：
+    - ollama：本地模型，資料不外傳，免費
+    - openai：OpenAI API（GPT-4o 等），需要 API 金鑰
+    - azure：Azure OpenAI Service，企業級部署
+    """
+    if provider == "ollama":
+        return ChatOllama(model=model, temperature=0)
+
+    elif provider == "openai":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            temperature=0,
+        )
+
+    elif provider == "azure":
+        from langchain_openai import AzureChatOpenAI
+        import os
+        return AzureChatOpenAI(
+            azure_deployment=model,
+            api_key=api_key,
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", ""),
+            api_version="2024-02-01",
+            temperature=0,
+        )
+
+    else:
+        raise ValueError(f"不支援的 provider: {provider}，請選擇 ollama / openai / azure")
+
+
 # ── RAGChatbot ────────────────────────────────────────────────────────────────
 class RAGChatbot:
     """
     使用 LangGraph 實作的 Corrective RAG 聊天機器人。
+    支援多種 LLM 供應商：Ollama（本地）、OpenAI、Azure OpenAI。
 
     圖結構：
         START
@@ -56,9 +98,17 @@ class RAGChatbot:
                                            retrieve （再試一次）
     """
 
-    def __init__(self, vector_store: VectorStore, model: str = DEFAULT_MODEL):
+    def __init__(
+        self,
+        vector_store: VectorStore,
+        model: str = DEFAULT_MODEL,
+        provider: str = DEFAULT_PROVIDER,
+        api_key: str = "",
+    ):
         self.vector_store = vector_store
         self.model = model
+        self.provider = provider
+        self.api_key = api_key
         self._graph = None  # 延遲建立，第一次 chat() 才組裝
 
     # ── 建立 LangGraph 圖 ────────────────────────────────────────────────────
@@ -72,14 +122,12 @@ class RAGChatbot:
         呼叫 chain.invoke({...}) 就會依序執行每個步驟。
         """
 
-        # ChatOllama：LangChain 包裝的 Ollama 對話模型
-        # temperature=0 讓 yes/no 評分更穩定
-        llm = ChatOllama(model=self.model, temperature=0)
+        # 根據 provider 建立對應的 LLM
+        # 這裡換 provider 只需要改這一行，底下所有 chain 完全不用動
+        llm = build_llm(self.provider, self.model, self.api_key)
         vs = self.vector_store
 
         # ── Chain 1：文件相關性評分器 ────────────────────────────────────────
-        # 用途：判斷撈回來的段落是否真的與問題有關
-        # 輸出：只回答 "yes" 或 "no"
         grader = (
             ChatPromptTemplate.from_messages([
                 ("system",
@@ -92,8 +140,6 @@ class RAGChatbot:
         )
 
         # ── Chain 2：查詢改寫器 ──────────────────────────────────────────────
-        # 用途：當撈不到相關段落時，把問題改寫成更適合向量搜尋的語句
-        # 例如：「公司假期怎麼算？」→「員工年假計算規則」
         rewriter = (
             ChatPromptTemplate.from_messages([
                 ("system",
@@ -106,7 +152,6 @@ class RAGChatbot:
         )
 
         # ── Chain 3：回答生成器 ──────────────────────────────────────────────
-        # 用途：根據篩選後的相關段落 + 對話歷史，生成最終回答
         generator = (
             ChatPromptTemplate.from_messages([
                 ("system",
@@ -125,16 +170,8 @@ class RAGChatbot:
         )
 
         # ── 節點定義 ─────────────────────────────────────────────────────────
-        # 每個節點：接收完整 state，回傳要更新的 key-value dict
-
         def retrieve(state: GraphState) -> dict:
-            """
-            【節點 1】向量搜尋
-
-            呼叫 VectorStore.search_with_scores() 做語意搜尋，
-            把相關度分數存進每個 Document 的 metadata，
-            方便後續 UI 顯示相似度百分比。
-            """
+            """【節點 1】向量搜尋"""
             results = vs.search_with_scores(state["question"], k=5)
             docs = []
             for doc, score in results:
@@ -143,15 +180,7 @@ class RAGChatbot:
             return {"documents": docs}
 
         def grade_documents(state: GraphState) -> dict:
-            """
-            【節點 2】LLM 相關性評分
-
-            對每個撈回的段落，讓 LLM 判斷「這段文字對回答問題有沒有幫助」。
-            過濾掉回答 'no' 的段落，只保留真正相關的段落。
-
-            這步驟解決向量搜尋的假陽性問題：
-            向量相似不代表語意真的相關，讓 LLM 再做一層把關。
-            """
+            """【節點 2】LLM 相關性評分"""
             relevant = []
             for doc in state["documents"]:
                 verdict = grader.invoke({
@@ -163,15 +192,7 @@ class RAGChatbot:
             return {"documents": relevant}
 
         def rewrite_query(state: GraphState) -> dict:
-            """
-            【節點 3】查詢改寫（Corrective RAG 的核心）
-
-            當 grade_documents 發現撈回的段落都不相關時，
-            代表原始問題的「向量表示」可能不夠好，
-            讓 LLM 把問題改寫成更具體的搜尋語句，然後再試一次。
-
-            retries +1 防止無限迴圈（超過 MAX_RETRIES 就強制進 generate）。
-            """
+            """【節點 3】查詢改寫"""
             new_question = rewriter.invoke({"question": state["question"]})
             return {
                 "question": new_question.strip(),
@@ -179,14 +200,7 @@ class RAGChatbot:
             }
 
         def generate(state: GraphState) -> dict:
-            """
-            【節點 4】生成最終回答
-
-            把篩選後的相關段落組合成 context，
-            加上對話歷史一起送給 LLM 生成回答。
-            若 documents 是空的（知識庫無相關資料），
-            context 會標示「無相關資料」讓 LLM 誠實回答。
-            """
+            """【節點 4】生成最終回答"""
             context = "\n\n---\n\n".join(
                 f"[來源: {d.metadata.get('source', 'Unknown')} | "
                 f"相關度: {d.metadata.get('_relevance', 0):.1%}]\n{d.page_content}"
@@ -207,14 +221,6 @@ class RAGChatbot:
 
         # ── 條件路由函式 ─────────────────────────────────────────────────────
         def decide_after_grading(state: GraphState) -> str:
-            """
-            grade_documents 完成後決定下一步：
-
-            - 如果還有相關段落 → 直接 generate
-            - 如果完全沒相關段落，且還有重試次數 → rewrite_query
-            - 如果完全沒相關段落，但已超過重試上限 → 仍然 generate
-              （會用空 context 讓 LLM 誠實回答沒有相關資料）
-            """
             if state["documents"] or state["retries"] >= MAX_RETRIES:
                 return "generate"
             return "rewrite_query"
@@ -222,19 +228,16 @@ class RAGChatbot:
         # ── 組裝圖 ───────────────────────────────────────────────────────────
         g = StateGraph(GraphState)
 
-        # 加入節點
         g.add_node("retrieve", retrieve)
         g.add_node("grade_documents", grade_documents)
         g.add_node("rewrite_query", rewrite_query)
         g.add_node("generate", generate)
 
-        # 加入固定邊（必定走這條路）
         g.add_edge(START, "retrieve")
         g.add_edge("retrieve", "grade_documents")
-        g.add_edge("rewrite_query", "retrieve")   # 改寫後重新撈
+        g.add_edge("rewrite_query", "retrieve")
         g.add_edge("generate", END)
 
-        # 加入條件邊（根據 decide_after_grading 的回傳值決定去哪）
         g.add_conditional_edges(
             "grade_documents",
             decide_after_grading,
@@ -248,18 +251,12 @@ class RAGChatbot:
 
     # ── 對外介面 ────────────────────────────────────────────────────────────
     def chat(self, history: list[dict], user_query: str) -> tuple[str, list[dict]]:
-        """
-        執行 LangGraph 圖，取得回答與參考段落。
-
-        第一次呼叫時才建立 graph（延遲初始化），
-        避免模型未安裝時在 import 階段就報錯。
-        """
+        """執行 LangGraph 圖，取得回答與參考段落。"""
         if self._graph is None:
             self._graph = self._build_graph()
 
         recent_history = history[-(MAX_HISTORY_TURNS * 2):]
 
-        # invoke() 啟動整個圖，從 START 一路跑到 END
         result = self._graph.invoke({
             "question": user_query,
             "documents": [],
@@ -268,7 +265,6 @@ class RAGChatbot:
             "history": recent_history,
         })
 
-        # 把 LangChain Document 物件轉成 UI 用的 dict 格式
         retrieved_docs = [
             {
                 "content": doc.page_content,

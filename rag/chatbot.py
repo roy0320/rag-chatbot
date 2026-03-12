@@ -1,4 +1,5 @@
 import ollama as _ollama
+import os
 from typing import TypedDict
 
 from langchain_ollama import ChatOllama
@@ -54,7 +55,8 @@ def build_llm(provider: str, model: str, api_key: str = "") -> BaseChatModel:
     - azure：Azure OpenAI Service，企業級部署
     """
     if provider == "ollama":
-        return ChatOllama(model=model, temperature=0)
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        return ChatOllama(model=model, temperature=0, base_url=ollama_host)
 
     elif provider == "openai":
         from langchain_openai import ChatOpenAI
